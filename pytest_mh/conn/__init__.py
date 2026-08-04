@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
 import itertools
 import os
+import re
 import shlex
 import signal
 import textwrap
+import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Generator, Generic, NoReturn, Self, TypeVar
@@ -1149,6 +1152,10 @@ class Shell(ABC):
         self.shell_command: str = shell_command
         """Shell command that will execute user scripts."""
 
+    def sanitize_stderr(self, stderr: list[str]) -> list[str]:
+        """Return stderr lines; subclasses may strip shell-specific noise."""
+        return stderr
+
     @abstractmethod
     def build_command_line(self, script: str, *, cwd: str | None, env: dict[str, Any]) -> str:
         """
@@ -1217,19 +1224,58 @@ class Bash(Shell):
 class Powershell(Shell):
     """
     Powershell shell abstraction.
+
+    Scripts are passed via ``-EncodedCommand`` (UTF-16LE base64) so quoting stays
+    intact when the SSH login shell is bash (e.g. Cygwin) or cmd.
     """
 
+    _CLIXML_NS = "http://schemas.microsoft.com/powershell/2004/04"
+    _CLIXML_HEX_RE = re.compile(r"_x([0-9A-Fa-f]{4})_")
+    # EncodedCommand + redirected stderr emits progress/errors as CLIXML.
+    _SCRIPT_PREAMBLE = "$ProgressPreference = 'SilentlyContinue'\n"
+
     def __init__(self) -> None:
-        super().__init__("powershell", "powershell -NonInteractive -Command")
+        # -OutputFormat Text: prefer text streams; CLIXML may still appear (see sanitize_stderr)
+        super().__init__(
+            "powershell",
+            "powershell -NonInteractive -OutputFormat Text -EncodedCommand",
+        )
 
     def build_command_line(self, script: str, *, cwd: str | None, env: dict[str, Any]) -> str:
         full_script = self._add_cwd_and_env(script, cwd=cwd, env=env)
-        escaped_script = self._escape_quotes(full_script)
+        encoded = base64.b64encode(full_script.encode("utf-16-le")).decode("ascii")
 
-        return f"{self.shell_command} '{escaped_script}'"
+        return f"{self.shell_command} {encoded}"
+
+    def sanitize_stderr(self, stderr: list[str]) -> list[str]:
+        text = "\n".join(stderr)
+        if "#< CLIXML" not in text and "#<CLIXML" not in text:
+            return stderr
+
+        lines: list[str] = []
+        for chunk in re.split(r"#<\s*CLIXML", text):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            try:
+                root = ET.fromstring(chunk)
+            except ET.ParseError:
+                continue
+            for node in root.iter(f"{{{self._CLIXML_NS}}}S"):
+                stream = node.get("S")
+                if stream not in (None, "Error", "Warning"):
+                    continue
+                decoded = self._decode_clixml_text(node.text or "").rstrip("\r\n")
+                if decoded:
+                    lines.extend(decoded.splitlines())
+
+        return lines
+
+    def _decode_clixml_text(self, value: str) -> str:
+        return self._CLIXML_HEX_RE.sub(lambda m: chr(int(m.group(1), 16)), value)
 
     def _add_cwd_and_env(self, script: str, *, cwd: str | None, env: dict[str, Any]) -> str:
-        out = ""
+        out = self._SCRIPT_PREAMBLE
 
         # Set environment variables
         for key, value in env.items():
@@ -1239,15 +1285,9 @@ class Powershell(Shell):
         if cwd is not None:
             out += f"cd {shlex.quote(cwd)}\n"
 
-        if out:
+        if env or cwd is not None:
             out += "\n"
 
         out += script
 
         return out
-
-    def _escape_quotes(self, command: str) -> str:
-        """
-        We need to escape quotes inside the script to make it work correctly.
-        """
-        return command.replace("'", "''").replace('"', '\\"')

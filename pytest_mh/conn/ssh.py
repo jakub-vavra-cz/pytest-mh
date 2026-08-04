@@ -341,12 +341,13 @@ class SSHProcess(Process[SSHProcessResult, SSHInputBuffer, SSHProcessTimeoutErro
             self.__stdout.finish()
             self.__stderr.finish()
 
+            stderr = self.shell.sanitize_stderr(self.__stderr.lines)
             error = SSHProcessError(
-                code, self.id, self.command, self.cwd, self.env, self.input, self.__stdout.lines, self.__stderr.lines
+                code, self.id, self.command, self.cwd, self.env, self.input, self.__stdout.lines, stderr
             )
 
             result = SSHProcessResult(
-                code, self.__stdout.lines, self.__stderr.lines, error, unified_newlines=self.__unified_newlines
+                code, self.__stdout.lines, stderr, error, unified_newlines=self.__unified_newlines
             )
         except TimeoutError as e:
             self.__stdout.read_once_into_buffer()
@@ -354,9 +355,8 @@ class SSHProcess(Process[SSHProcessResult, SSHInputBuffer, SSHProcessTimeoutErro
             stdout = (
                 [line.rstrip("\r") for line in self.__stdout.lines] if self.__unified_newlines else self.__stdout.lines
             )
-            stderr = (
-                [line.rstrip("\r") for line in self.__stderr.lines] if self.__unified_newlines else self.__stderr.lines
-            )
+            stderr = self.shell.sanitize_stderr(self.__stderr.lines)
+            stderr = [line.rstrip("\r") for line in stderr] if self.__unified_newlines else stderr
             raise SSHProcessTimeoutError(
                 e.args[0],
                 self.id,
